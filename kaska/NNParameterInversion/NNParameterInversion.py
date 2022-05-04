@@ -89,6 +89,8 @@ class NNParameterInversion(object):
             retval = self.inverse_param_model.predict(X.T)
             # OK, so we have the parameters. Re-arrange them on a 3D array
             # (params, ny, nx)
+            import pdb
+            pdb.set_trace()
             n_cells, n_params = retval.shape
             params = np.zeros((n_params, ny, nx))
             for i in range(n_params):

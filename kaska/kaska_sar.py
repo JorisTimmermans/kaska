@@ -1,161 +1,489 @@
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python
 
-"""Main module."""
+import os
+import osr
+import gdal
+import datetime
 import logging
-import time  # Just for timekeeping
-import datetime as dt
 import numpy as np
-
+from netCDF4 import Dataset
+from scipy.ndimage import label
+from skimage.filters import sobel
+from collections import namedtuple
+from scipy.optimize import minimize
 from scipy.interpolate import interp1d
+from scipy.ndimage.filters import gaussian_filter1d
 
-import scipy.optimize
+from .utils import reproject_data
+from .watercloudmodel import cost_function
 
-# from .NNParameterInversion import NNParameterInversion
+component_progress_logger = logging.getLogger('ComponentProgress')
+component_progress_logger.setLevel(logging.INFO)
+component_progress_formatter = logging.Formatter('%(levelname)s:%(name)s:%(message)s')
+component_progress_logging_handler = logging.StreamHandler()
+component_progress_logging_handler.setLevel(logging.INFO)
+component_progress_logging_handler.setFormatter(component_progress_formatter)
+component_progress_logger.addHandler(component_progress_logging_handler)
 
-# from .s2_observations import Sentinel2Observations
+def save_to_tif(fname, Array, GeoT):
+    if os.path.exists(fname):
+        os.remove(fname)
+    ds = gdal.GetDriverByName('GTiff').Create(fname, Array.shape[2], Array.shape[1], Array.shape[0], gdal.GDT_Float32)
+    ds.SetGeoTransform(GeoT)
+    wkt = 'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.01745329251994328,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4326"]]'
+    ds.SetProjection(wkt)
+    for i, image in enumerate(Array):
+        # ds.GetRasterBand(i+1).SetMetadata({'date': prior_time[i]})
+        ds.GetRasterBand(i+1).WriteArray( image )
+    ds.FlushCache()
+    return fname
 
-from .s1_observations import Sentinel1Observations
 
-# from .smoothn import smoothn
+def get_sar(s1_nc_file):
+    s1_data = namedtuple('s1_data', 'time lat lon satellite  relorbit orbitdirection ang_name vv_name, vh_name')
+    data = Dataset(s1_nc_file)
+    relorbit            = data['relorbit'][:]
+    localIncidenceAngle = data['localIncidenceAngle'][:]
+    satellite           = data['satellite'][:]
+    orbitdirection      = data['orbitdirection'][:]
+    time                = data['time'][:]
+    lat = data['lat'][:]
+    lon = data['lon'][:]
 
-from .utils import define_temporal_grid, save_output_parameters
+    vv_name = s1_nc_file.replace('.nc', '_vv.tif')
+    vh_name = s1_nc_file.replace('.nc', '_vh.tif')
+    ang_name = s1_nc_file.replace('.nc', '_ang.tif')
 
-from .watercloudmodel import cost, cost_jac, cost_hess
+    if not os.path.exists(vv_name):
+        gg = gdal.Open('NETCDF:"%s":sigma0_vv_norm_multi'%s1_nc_file)
+        geo = gg.GetGeoTransform()
+        sigma0_vv_norm_multi_db = data['sigma0_vv_norm_multi'][:]
+        save_to_tif(vv_name, sigma0_vv_norm_multi_db, geo)
 
+    if not os.path.exists(vh_name):
+        gg = gdal.Open('NETCDF:"%s":sigma0_vh_norm_multi'%s1_nc_file)
+        geo = gg.GetGeoTransform()
+        sigma0_vh_norm_multi_db = data['sigma0_vh_norm_multi'][:]
+        save_to_tif(vh_name, sigma0_vh_norm_multi_db, geo)
 
-LOG = logging.getLogger(__name__)
+    if not os.path.exists(ang_name):
+        gg = gdal.Open('NETCDF:"%s":localIncidenceAngle'%s1_nc_file)
+        geo = gg.GetGeoTransform()
+        localIncidenceAngle = data['localIncidenceAngle'][:]
+        save_to_tif(ang_name, localIncidenceAngle, geo)
 
+    return s1_data(time, lat, lon, satellite, relorbit, orbitdirection, ang_name, vv_name, vh_name)
 
-def sar_inversion(s1_obs, s2_data):
-    """SAR inversion"""
+def read_sar(sar_data, state_mask):
+    s1_data = namedtuple('s1_data', 'time lat lon satellite  relorbit orbitdirection ang vv vh')
+
+    ang = reproject_data(sar_data.ang_name, output_format="MEM", target_img=state_mask)
+    vv  = reproject_data(sar_data.vv_name, output_format="MEM", target_img=state_mask)
+    vh  = reproject_data(sar_data.vh_name, output_format="MEM", target_img=state_mask)
+
+    time = [datetime.datetime(1970,1,1) + datetime.timedelta(days=float(i)) for i in  sar_data.time]
+    return s1_data(time, sar_data.lat, sar_data.lon, sar_data.satellite, sar_data.relorbit, sar_data.orbitdirection, ang, vv, vh)
+
+def read_s2_lai(s2_lai, s2_cab, s2_cbrown, state_mask):
+    s2_data = namedtuple('s2_lai', 'time lai cab cbrown')
+    g = gdal.Open(s2_lai)
+    time = []
+    for i in range(g.RasterCount):
+        gg = g.GetRasterBand(i+1)
+        meta = gg.GetMetadata()
+        time.append(datetime.datetime.strptime(meta['DoY'], '%Y%j'))
+    lai  = reproject_data(s2_lai, output_format="MEM", target_img=state_mask)
+    cab  = reproject_data(s2_cab, output_format="MEM", target_img=state_mask)
+    cbrown  = reproject_data(s2_cbrown, output_format="MEM", target_img=state_mask)
+    return s2_data(time, lai, cab, cbrown)
+
+def inference_preprocessing(s1_data, s2_data):
+    """Resample S2 smoothed output to match S1 observations
+    times"""
     # Move everything to DoY to simplify interpolation
-    s2_doys = [int(dt.datetime.strftime(x, "%j"))
-               for x in s2_data.f.temporal_grid]
-    s1_doys = [int(dt.datetime.strftime(x, "%j"))
-               for x in s1_obs.dates.keys()]
-    n_sar_obs = len(s1_doys)
-    s1_temporal_grid = sorted(s1_obs.dates.keys())
 
-    # Interpolate S2 retrievals to S1 time grid
-    func = interp1d(s2_doys, s2_data.f.slai, axis=0, bounds_error=False)
-    lai_s1 = func(s1_doys)
-    func = interp1d(s2_doys, s2_data.f.scab, axis=0, bounds_error=False)
-    cab_s1 = func(s1_doys)
-    func = interp1d(s2_doys, s2_data.f.scbrown, axis=0, bounds_error=False)
-    # cbrown_s1 = f(s1_doys)
-    # Read in S1 data
-    s1_backscatter = s1_obs.read_time_series(s1_temporal_grid)
+    sar_inference_data = namedtuple('sar_inference_data', 'time lat lon satellite  relorbit orbitdirection ang vv vh lai cab cbrown time_mask fields')
 
-    # Wrap cost functions. NB The cab argument isn't used in these functions.
-    def cost_nolai(my_xx, svh, svv, lai, cab, theta):
-        n_obs = len(svh)
-        return cost(np.concatenate([my_xx[:6], lai, lai, my_xx[-n_obs:]]),
-                    svh, svv, theta)
 
-    def cost_nolai_jac(my_xx, svh, svv, lai, cab, theta):
-        n_obs = len(svh)
-        return cost_jac(np.concatenate([my_xx[:6], lai, lai, my_xx[-n_obs:]]),
-                        svh, svv, theta)
+    s2_doys = np.array([ int(i.strftime('%j')) for i in s2_data.time])
+    s1_doys = np.array([ int(i.strftime('%j')) for i in s1_data.time])
 
-    def cost_nolai_hess(my_xx, svh, svv, lai, cab, theta):
-        n_obs = len(svh)
-        return cost_hess(np.concatenate([my_xx[:6], lai, lai, my_xx[-n_obs:]]),
-                         svh, svv, theta)
+    time_mask = (s1_doys >= s2_doys.min()) & (s1_doys <= s2_doys.max())
 
-    avv, bvv, cvv = -12, 0.05, 0.1
-    avh, bvh, cvh = -14, 0.01, 0.1
-    sigma_soil0 = np.zeros(n_sar_obs)*0.2  # Say
-    x0_all = \
-        np.r_[avv, bvv, cvv, avh, bvh, cvh, sigma_soil0]  # ,V1,V2,sigma_soil]
-    n_t, n_y, n_x = lai_s1.shape
-    avv_out = np.zeros((n_y, n_x))
-    bvv_out = np.zeros((n_y, n_x))
-    cvv_out = np.zeros((n_y, n_x))
-    avh_out = np.zeros((n_y, n_x))
-    bvh_out = np.zeros((n_y, n_x))
-    cvh_out = np.zeros((n_y, n_x))
-    cost_f = np.zeros((n_y, n_x))
-    sigma_soil_out = np.zeros((n_t, n_y, n_x))
-    tic = time.time()
-    n_pxls = 0
-    # bounds = [
-    #    [-40, -5],
-    #    [1e-4, 1],
-    #    [-40, -1],
-    #    [-40, -5],
-    #    [1e-4, 1],
-    #    [-40, -1],
-    #    *([[0.01, 1]]*n_sar_obs)
-    # ]
-    x_0 = x0_all
-    for (row, col) in np.ndindex(*lai_s1[0].shape):
-        lai = lai_s1[:, row, col]
-        if lai.max() < 2.5:
-            cost_f[row, col] = -900.  # No dynamics
-            continue
-        # Select one pixel
-        svv = 10*np.log10(s1_backscatter.VV[:, row, col])
-        svh = 10*np.log10(s1_backscatter.VH[:, row, col])
-        theta = s1_backscatter.theta[:, row, col]
-        sigma_soil0 = np.ones_like(svv)*0.2
+    f = interp1d(s2_doys, s2_data.lai.ReadAsArray(), axis=0, bounds_error=False)
+    lai_s1 = f(s1_doys)
+    f = interp1d(s2_doys, s2_data.cab.ReadAsArray(), axis=0, bounds_error=False)
+    cab_s1 = f(s1_doys)
+    f = interp1d(s2_doys, s2_data.cbrown.ReadAsArray(), axis=0, bounds_error=False)
+    cbrown_s1 = f(s1_doys)
+    # segmentation
+    lai_max = np.nanmax(s2_data.lai.ReadAsArray(), axis=0)
+    patches = sobel(lai_max)>0.001
+    fields  = label(patches)[0]
+    sar_inference_data = sar_inference_data(s1_data.time, s1_data.lat, s1_data.lon,
+                                            s1_data.satellite, s1_data.relorbit,
+                                            s1_data.orbitdirection, s1_data.ang,
+                                            s1_data.vv, s1_data.vh, lai_s1, cab_s1, cbrown_s1, time_mask, fields)
 
-        cab = cab_s1[:, row, col]
-        # Might be worth defining Cxx from LAI=0 average and
-        #  Axx when LAI=LAI.max()
-        x_0[2] = svv[lai < 0.3].mean()
-        x_0[5] = svh[lai < 0.3].mean()
-        x_0[0] = svv[lai > (0.9*lai.max())].mean()
-        x_0[3] = svh[lai > (0.9*lai.max())].mean()
-        retval = scipy.optimize.minimize(cost_nolai, x_0,
-                                         args=(svh, svh, lai, cab, theta),
-                                         jac=cost_nolai_jac,
-                                         hess=cost_nolai_hess,
-                                         method="Newton-CG")
-        avv_out[row, col] = retval.x[0]
-        bvv_out[row, col] = retval.x[1]
-        cvv_out[row, col] = retval.x[2]
-        avh_out[row, col] = retval.x[3]
-        bvh_out[row, col] = retval.x[4]
-        cvh_out[row, col] = retval.x[5]
-        cost_f[row, col] = retval.fun
-        sigma_soil_out[:, row, col] = retval.x[6:]
-        if retval.fun < 1e5:
-            print(f"Good good...{row:d}, {col:d}")
-            x_0 = retval.x
+    return sar_inference_data
+
+
+def get_prior(s1_data, soilMoisture, soilMoisture_std, soilRoughness, soilRoughness_std, state_mask):
+    # this is the function to reading the soil moisture prior
+    # and the soil roughness prior using the satemask
+    # the assumption of inputs are daily data in geotifs
+    prior = namedtuple('prior', 'time sm_prior sm_std sr_prior sr_std')
+
+    g = gdal.Open(soilMoisture)
+    time = []
+    for i in range(g.RasterCount):
+        gg = g.GetRasterBand(i+1)
+        meta = gg.GetMetadata()
+        time.append(datetime.datetime.strptime(meta['date'], '%Y-%m-%d'))
+    sm_prior  = reproject_data(soilMoisture,     output_format="MEM", target_img=state_mask)
+    sm_std    = reproject_data(soilMoisture_std, output_format="MEM", target_img=state_mask)
+    sr_prior  = reproject_data(soilRoughness,    output_format="MEM", target_img=state_mask)
+    sr_std    = reproject_data(soilRoughness_std,output_format="MEM", target_img=state_mask)
+
+    prior_doy = np.array([ int(i.strftime('%j')) for i in time])
+    s1_doys = np.array([ int(i.strftime('%j')) for i in s1_data.time])
+
+    f = interp1d(prior_doy, sm_prior.ReadAsArray(), axis=0, bounds_error=False)
+
+    sm_s1 = f(s1_doys)
+    f = interp1d(prior_doy,   sm_std.ReadAsArray(), axis=0, bounds_error=False)
+    sm_std_s1 = f(s1_doys)
+
+    f = interp1d(prior_doy, sr_prior.ReadAsArray(), axis=0, bounds_error=False)
+    sr_s1 = f(s1_doys)
+    f = interp1d(prior_doy,   sr_std.ReadAsArray(), axis=0, bounds_error=False)
+    sr_std_s1 = f(s1_doys)
+
+    return prior(time, sm_s1, sm_std_s1, sr_s1, sr_std_s1)
+
+def fresnel(eps, theta):
+    theta = np.deg2rad(theta)
+    num = (eps-1)*(np.sin(theta)**2 - eps*(1+np.sin(theta)**2))
+    den = eps*np.cos(theta) + np.sqrt(eps - np.sin(theta)**2)
+    den = den**2
+    return np.abs(num/den)
+
+def mv2eps(a, b, c, mv):
+    eps = a + b * mv + c * mv**2
+    return eps
+
+def quad_approx_solver(a, b, c, theta, alphas):
+    x = np.arange(0.01, 0.5, 0.01)
+    p = np.polyfit(x, fresnel(mv2eps(a, b, c, x),theta.mean()), 2)
+    # 2nd order polynomial
+    #solve
+    solutions = [np.roots([p[0], p[1], p[2]-aa]) for aa in alphas]
+    return solutions
+
+
+def do_one_pixel_field(sar_inference_data, vv, vh, lai, theta, time, sm, sm_std, sr, sr_std):
+
+    orbits = sar_inference_data.relorbit[sar_inference_data.time_mask]
+
+    lais   = []
+    srs    = []
+    alphas = []
+    sms    = []
+    ps     = []
+    times  = []
+    uorbits = np.unique(orbits)
+    for i, orbit in enumerate(uorbits):
+        orbit_mask = orbits == orbit
+        ovv, ovh, olai, otheta, otime = vv[orbit_mask], vh[orbit_mask], lai[orbit_mask], theta[orbit_mask], time[orbit_mask]
+        osm, osm_std, osro, osro_std  = sm[orbit_mask], sm_std[orbit_mask], sr[orbit_mask], sr_std[orbit_mask]
+
+        olai_std = np.ones_like(olai)*0.05
+
+        alpha     = fresnel(mv2eps(1.99, 38.9, 11.5, osm), otheta)
+        alpha_std = np.ones_like(alpha)*0.2
+
+        soil_sigma_mask = olai < 1
+        sigma_soil_vv_mu = np.mean(ovv[soil_sigma_mask])
+        sigma_soil_vh_mu = np.mean(ovh[soil_sigma_mask])
+
+        xvv = np.array([1, 0.5, sigma_soil_vv_mu])
+        xvh = np.array([1, 0.5, sigma_soil_vh_mu])
+
+        prior_mean = np.concatenate([[0,   ]*6, alpha,     osro,     olai])
+        prior_unc  = np.concatenate([[10., ]*6, alpha_std, osro_std, olai_std])
+
+        x0 = np.concatenate([xvv, xvh, alpha, osro, olai])
+
+        bounds = (
+            [[None, None]] * 6
+          + [[0.1,   3.3]] * olai.shape[0]
+          + [[0,     .03]] * olai.shape[0]
+          + [[0,       8]] * olai.shape[0]
+          )
+
+        gamma = [1000, 1000]
+        retval = minimize(cost_function,
+                            x0,
+                            args=(ovh, ovv, otheta, gamma, prior_mean, prior_unc),
+                            jac=True,
+                            bounds = bounds,
+                            options={"disp": False},)
+
+        posterious_lai   = retval.x[6+2*len(olai) : ]
+        posterious_sr    = retval.x[6+len(olai)   : 6+2*len(olai)]
+        posterious_alpha = retval.x[6             : 6+len(olai)]
+        sols = np.array(quad_approx_solver(1.99, 38.9, 11.5, otheta, posterious_alpha)).min(axis=1)
+        lais.append(posterious_lai)
+        srs.append(posterious_sr)
+        sms.append(sols)
+        times.append(otime)
+        ps.append(retval.x[:6])
+
+    order = np.argsort(np.hstack(times))
+    times  = np.hstack(times )[order]
+    lais   = np.hstack(lais  )[order]
+    srs    = np.hstack(srs   )[order]
+    sms    = np.hstack(sms   )[order].real
+    return times, lais, srs, sms, np.array(ps)
+
+def do_inversion(sar_inference_data, prior, state_mask, segment=False):
+
+    orbits = sar_inference_data.relorbit[sar_inference_data.time_mask]
+    uorbits = np.unique(orbits)
+    if segment:
+        out_shape   = sar_inference_data.lai[sar_inference_data.time_mask].shape
+        lai_outputs = np.zeros(out_shape )
+        sm_outputs  = np.zeros(out_shape )
+        sr_outputs  = np.zeros(out_shape )
+
+        ps_shape = (len(uorbits),) +  sar_inference_data.lai.shape[1:]
+
+        Avv_outputs  = np.zeros(ps_shape)
+        Bvv_outputs  = np.zeros(ps_shape)
+        Cvv_outputs  = np.zeros(ps_shape)
+
+        Avh_outputs  = np.zeros(ps_shape)
+        Bvh_outputs  = np.zeros(ps_shape)
+        Cvh_outputs  = np.zeros(ps_shape)
+
+        fields = np.unique(sar_inference_data.fields)[1:]
+        for field in fields:
+            # get per field data
+            # with time mask as well
+            field_mask = sar_inference_data.fields == field
+            time  = np.array(sar_inference_data.time)[sar_inference_data.time_mask]
+
+            lai   = sar_inference_data.lai[sar_inference_data.time_mask][:, field_mask]
+
+            sm    = prior.sm_prior[sar_inference_data.time_mask][:, field_mask]
+            sm_std= prior.sm_std  [sar_inference_data.time_mask][:, field_mask]
+
+            sm[np.isnan(sm)] = 0.2
+            sm_std[sm_std==0] = 0.5
+            sm_std[np.isnan(sm_std)] = 0.5
+
+            sr    = prior.sr_prior[sar_inference_data.time_mask][:, field_mask]
+            sr_std= prior.sr_std  [sar_inference_data.time_mask][:, field_mask]
+            sr[np.isnan(sr)] = 0.03
+            sr_std[np.isnan(sr_std)] = 1
+
+            vv    = sar_inference_data.vv.ReadAsArray()[sar_inference_data.time_mask][:, field_mask]
+            vh    = sar_inference_data.vh.ReadAsArray()[sar_inference_data.time_mask][:, field_mask]
+            theta = sar_inference_data.ang.ReadAsArray()[sar_inference_data.time_mask][:, field_mask]
+
+
+            lai   = np.nanmean(lai, axis=1)
+            vv    = np.nanmean(vv, axis=1)
+            vh    = np.nanmean(vh, axis=1)
+            theta = np.nanmean(theta, axis=1)
+
+            sm     = np.nanmean(sm, axis=1)
+            sm_std = np.nanmean(sm_std, axis=1)
+
+            sr     = np.nanmean(sr, axis=1)
+            sr_std = np.nanmean(sr_std, axis=1)
+
+            vv = np.maximum(vv, 0.0001)
+            vv = 10 * np.log10(vv)
+            vh = np.maximum(vh, 0.0001)
+            vh = 10 * np.log10(vh)
+
+            times, lais, srs, sms, ps = do_one_pixel_field(sar_inference_data, vv, vh, lai, theta, time, sm, sm_std, sr, sr_std)
+
+            lai_outputs[:, field_mask] = lais[...,None]
+            sr_outputs[:, field_mask]  = srs [...,None]
+            sm_outputs[:, field_mask]  = sms [...,None]
+
+            for i in range(len(uorbits)):
+                Avv_outputs[i, field_mask]  = ps[i,0]
+                Bvv_outputs[i, field_mask]  = ps[i,1]
+                Cvv_outputs[i, field_mask]  = ps[i,2]
+                Avh_outputs[i, field_mask]  = ps[i,3]
+                Bvh_outputs[i, field_mask]  = ps[i,4]
+                Cvh_outputs[i, field_mask]  = ps[i,5]
+    else:
+        if type(state_mask) == str:
+            mask = gdal.Open(state_mask).ReadAsArray()
         else:
-            # Rubbish inversion, do not use parameters!
-            x_0 = x0_all
+            mask = state_mask.ReadAsArray()
+        xs, ys = np.where(mask)
 
-        n_pxls += 1
-        if n_pxls % 1000 == 0:
-            n_pxls = 0
-            # LOG.info(f"Done 100 pixels in {(time.time()-tic):g}")
-            LOG.info("Done 100 pixels in %g", time.time()-tic)
-            tic = time.time()
-    return s1_temporal_grid, sigma_soil_out
+        out_shape   = sar_inference_data.lai[sar_inference_data.time_mask].shape
+        lai_outputs = np.zeros(out_shape )
+        sm_outputs  = np.zeros(out_shape )
+        sr_outputs  = np.zeros(out_shape )
+
+        ps_shape = (len(uorbits),) +  sar_inference_data.lai.shape[1:]
+
+        Avv_outputs  = np.zeros(ps_shape)
+        Bvv_outputs  = np.zeros(ps_shape)
+        Cvv_outputs  = np.zeros(ps_shape)
+
+        Avh_outputs  = np.zeros(ps_shape)
+        Bvh_outputs  = np.zeros(ps_shape)
+        Cvh_outputs  = np.zeros(ps_shape)
 
 
-def save_s1_output(output_folder, obs, sar_data, time_grid, chunk):
-    """Save the S1 output."""
-    save_output_parameters(time_grid, obs, output_folder, ["sigma"],
-                           [sar_data], output_format="GTiff",
-                           chunk=chunk, fname_pattern="s1")
+        for i in range(len(xs)):
+            if (i%1000) == 0:
+                component_progress_logger.info(f'{int((i/len(xs))*100)}')
+            indx, indy = xs[i], ys[i]
+
+            # field_mask = slice(None, None), slice(indx, indx+1), slice(indy, indy+1)
+            time  = np.array(sar_inference_data.time)[sar_inference_data.time_mask]
+            lai   = sar_inference_data.lai[sar_inference_data.time_mask][:, indx, indy ]
+
+            sm    = prior.sm_prior[sar_inference_data.time_mask][:, indx, indy ]
+            sm_std= prior.sm_std  [sar_inference_data.time_mask][:, indx, indy ]
+
+            sm[np.isnan(sm)] = 0.2
+            sm_std[sm_std==0] = 0.5
+            sm_std[np.isnan(sm_std)] = 0.5
+
+            sr    = prior.sr_prior[sar_inference_data.time_mask][:, indx, indy ]
+            sr_std= prior.sr_std  [sar_inference_data.time_mask][:, indx, indy ]
+            sr[np.isnan(sr)] = 0.03
+            sr_std[np.isnan(sr_std)] = 1
+
+            vv    = sar_inference_data.vv.ReadAsArray()[sar_inference_data.time_mask][:, indx, indy ]
+            vh    = sar_inference_data.vh.ReadAsArray()[sar_inference_data.time_mask][:, indx, indy ]
+            theta = sar_inference_data.ang.ReadAsArray()[sar_inference_data.time_mask][:, indx, indy ]
+
+            vv = np.maximum(vv, 0.0001)
+            vv = 10 * np.log10(vv)
+            vh = np.maximum(vh, 0.0001)
+            vh = 10 * np.log10(vh)
+
+            times, lais, srs, sms, ps = do_one_pixel_field(sar_inference_data, vv, vh, lai, theta, time, sm, sm_std, sr, sr_std)
+
+            lai_outputs[:, indx, indy] = lais
+            sr_outputs[:, indx, indy]  = srs
+            sm_outputs[:, indx, indy]  = sms
+
+            for i in range(len(uorbits)):
+                Avv_outputs[i, indx, indy]  = ps[i,0]
+                Bvv_outputs[i, indx, indy]  = ps[i,1]
+                Cvv_outputs[i, indx, indy]  = ps[i,2]
+                Avh_outputs[i, indx, indy]  = ps[i,3]
+                Bvh_outputs[i, indx, indy]  = ps[i,4]
+                Cvh_outputs[i, indx, indy]  = ps[i,5]
+    return lai_outputs, sr_outputs, sm_outputs, Avv_outputs, Bvv_outputs, Cvv_outputs, Avh_outputs, Bvh_outputs, Cvh_outputs, uorbits
+
+def save_output(fname, Array, GeoT, projction, time):
+    if os.path.exists(fname):
+        os.remove(fname)
+    ds = gdal.GetDriverByName('GTiff').Create(fname, Array.shape[2], Array.shape[1], Array.shape[0], gdal.GDT_Float32)
+    ds.SetGeoTransform(GeoT)
+    ds.SetProjection(projction)
+    for i, image in enumerate(Array):
+        ds.GetRasterBand(i+1).SetMetadata({'date': time[i]})
+        ds.GetRasterBand(i+1).WriteArray( image )
+    ds.FlushCache()
+    return fname
+
+def save_ps_output(fname, Array, GeoT, projction, orbit):
+    if os.path.exists(fname):
+        os.remove(fname)
+    ds = gdal.GetDriverByName('GTiff').Create(fname, Array.shape[2], Array.shape[1], Array.shape[0], gdal.GDT_Float32)
+    ds.SetGeoTransform(GeoT)
+    ds.SetProjection(projction)
+    for i, image in enumerate(Array):
+        ds.GetRasterBand(i+1).SetMetadata({'orbit': str(int(orbit[i]))})
+        ds.GetRasterBand(i+1).WriteArray( image )
+    ds.FlushCache()
+    return fname
 
 
-if __name__ == "__main__":
-    STATE_MASK = "/home/ucfajlg/Data/python/KaFKA_Validation/LMU/carto/ESU.tif"
-    NC_FILE = "/data/selene/ucfajlg/ELBARA_LMU/mirror_ftp/141.84.52.201" + \
-              "/S1/S1_LMU_site_2017_new.nc"
-    START_DATE = dt.datetime(2017, 5, 1)
-    END_DATE = dt.datetime(2017, 9, 1)
-    TEMPORAL_GRID_SPACE = 5
-    TEMPORAL_GRID = define_temporal_grid(START_DATE, END_DATE,
-                                         TEMPORAL_GRID_SPACE)
-    # Define S1 observations
-    S1_OBS = Sentinel1Observations(NC_FILE,
-                                   STATE_MASK,
-                                   time_grid=TEMPORAL_GRID)
 
-    # Read in smoothed S2 retrievals
-    S2_DATA = np.load("temporary_dump.npz")
-    sar_inversion(S1_OBS, S2_DATA)
+class KaSKASAR(object):
+    """A class to process Sentinel 1 SAR data using S2 data as
+    an input"""
+
+    def __init__(self, s1_ncfile, state_mask, s2_lai,  s2_cab, s2_cbrown, sm_prior, sm_std, sr_prior ,sr_std):
+        self.s1_ncfile = s1_ncfile
+        self.state_mask = state_mask
+        self.s2_lai    = s2_lai
+        self.s2_cab    = s2_cab
+        self.s2_cbrown = s2_cbrown
+        self.sm_prior  = sm_prior
+        self.sm_std    = sm_std
+        self.sr_prior  = sr_prior
+        self.sr_std    = sr_std
+
+    def sentinel1_inversion(self, segment=False):
+        sar = get_sar(s1_ncfile)
+        s1_data = read_sar(sar, self.state_mask)
+        s2_data = s2_data = read_s2_lai(self.s2_lai, self.s2_cab, self.s2_cbrown, self.state_mask)
+        prior   = get_prior(s1_data, self.sm_prior, self.sm_std, self.sr_prior, self.sr_std, self.state_mask)
+        sar_inference_data = inference_preprocessing(s1_data, s2_data)
+        lai_outputs, sr_outputs, sm_outputs, \
+        Avv_outputs, Bvv_outputs, Cvv_outputs, \
+        Avh_outputs, Bvh_outputs, Cvh_outputs, uorbits = do_inversion(sar_inference_data, prior, self.state_mask, segment)
+
+        gg = gdal.Open('NETCDF:"%s":sigma0_vh_norm_multi_db'%self.s1_ncfile)
+        geo = gg.GetGeoTransform()
+
+        projction = 'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.01745329251994328,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4326"]]'
+
+        time = [i.strftime('%Y-%m-%d') for i in np.array(sar_inference_data.time)[sar_inference_data.time_mask]]
+
+        sm_name  = self.s1_ncfile.replace('.nc', '_sar_sm.tif')
+        sr_name  = self.s1_ncfile.replace('.nc', '_sar_sr.tif')
+        lai_name = self.s1_ncfile.replace('.nc', '_sar_lai.tif')
+
+        save_output(sm_name,  sm_outputs,  geo, projction, time)
+        save_output(sr_name,  sr_outputs,  geo, projction, time)
+        save_output(lai_name, lai_outputs, geo, projction, time)
+
+        Avv_name = self.s1_ncfile.replace('.nc', '_Avv.tif')
+        Bvv_name = self.s1_ncfile.replace('.nc', '_Bvv.tif')
+        Cvv_name = self.s1_ncfile.replace('.nc', '_Cvv.tif')
+
+        Avh_name = self.s1_ncfile.replace('.nc', '_Avh.tif')
+        Bvh_name = self.s1_ncfile.replace('.nc', '_Bvh.tif')
+        Cvh_name = self.s1_ncfile.replace('.nc', '_Cvh.tif')
+
+        save_ps_output(Avv_name, Avv_outputs, geo, projction, uorbits)
+        save_ps_output(Bvv_name, Bvv_outputs, geo, projction, uorbits)
+        save_ps_output(Cvv_name, Cvv_outputs, geo, projction, uorbits)
+        save_ps_output(Avh_name, Avh_outputs, geo, projction, uorbits)
+        save_ps_output(Bvh_name, Bvh_outputs, geo, projction, uorbits)
+        save_ps_output(Cvh_name, Cvh_outputs, geo, projction, uorbits)
+
+
+if __name__ == '__main__':
+    s1_ncfile = '/data/nemesis/kaska-sar_quick/S1_LMU_site_2017_new.nc'
+    state_mask = "/home/ucfajlg/Data/python/KaFKA_Validation/LMU/carto/ESU.tif"
+    s2_folder = "/home/ucfajlg/Data/python/KaFKA_Validation/LMU/s2_obs/"
+    s2_lai = f"{s2_folder:s}/outputs/lai.tif"
+    s2_cab = f"{s2_folder:s}/outputs/cab.tif"
+    s2_cbrown = f"{s2_folder:s}/outputs/cbrown.tif"
+
+    sm_prior = '/data/nemesis/kaska-sar_quick/sm_prior.tif'
+    sm_std   = '/data/nemesis/kaska-sar_quick/sm_std.tif'
+    sr_prior = '/data/nemesis/kaska-sar_quick/sr_prior.tif'
+    sr_std   = '/data/nemesis/kaska-sar_quick/sr_std.tif'
+    sarsar = KaSKASAR(s1_ncfile, state_mask, s2_lai,  s2_cab, s2_cbrown, sm_prior, sm_std, sr_prior ,sr_std)
+
+    sarsar.sentinel1_inversion(True)
+

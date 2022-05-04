@@ -23,16 +23,15 @@ S2MSIdata = namedtuple(
 )
 
 
-class Sentinel2Observations():
-    """Class for dealing with Sentinel 2 observations"""
+class Sentinel2Observations(object):
     def __init__(
-            self,
-            parent_folder,
-            emulator,
-            state_mask,
-            band_prob_threshold=5,
-            chunk=None,
-            time_grid=None,
+        self,
+        parent_folder,
+        emulator,
+        state_mask,
+        band_prob_threshold=5,
+        chunk=None,
+        time_grid=None,
     ):
         self.band_prob_threshold = band_prob_threshold
         parent_folder = Path(parent_folder)
@@ -60,10 +59,9 @@ class Sentinel2Observations():
         self.original_mask = state_mask
         self.state_mask = state_mask
 
-        my_file = np.load(emulator, allow_pickle=True)
+        f = np.load(emulator, allow_pickle=True)
         self.emulator = Two_NN(
-            Hidden_Layers=my_file.f.Hidden_Layers,
-            Output_Layers=my_file.f.Output_Layers
+            Hidden_Layers=f.f.Hidden_Layers, Output_Layers=f.f.Output_Layers
         )
         LOG.debug("Read emulator in")
         LOG.debug("Searching for files....")
@@ -71,10 +69,10 @@ class Sentinel2Observations():
         self.chunk = chunk
 
     def apply_roi(self, ulx, uly, lrx, lry):
-        """Applies a region of interest (ROI) window to the state mask, which
-        is then used to subset the data spatially. Useful for spatial
-        windowing/chunking
-
+        """Applies a region of interest (ROI) window to the state mask, which is
+        then used to subset the data spatially. Useful for spatial windowing/
+        chunking
+        
         Parameters
         ----------
         ulx : integer
@@ -90,10 +88,10 @@ class Sentinel2Observations():
         None
         Doesn't return anything, but changes `self.state_mask`
         """
-        # self.ulx = ulx
-        # self.uly = uly
-        # self.lrx = lrx
-        # self.lry = lry
+        self.ulx = ulx
+        self.uly = uly
+        self.lrx = lrx
+        self.lry = lry
         width = lrx - ulx
         height = uly - lry
 
@@ -106,9 +104,9 @@ class Sentinel2Observations():
 
     def define_output(self):
         """Define the output array shapes to be consistent with the state
-        mask. You get the projection and geotransform, that should be
+        mask. You get the projection and geotransform, that should be 
         enough to define an ouput dataset that conforms to the state mask.
-
+        
         Returns
         -------
         tuple
@@ -116,20 +114,20 @@ class Sentinel2Observations():
             the second element is the geotransform.
         """
         try:
-            dataset = gdal.Open(self.state_mask)
-            proj = dataset.GetProjection()
-            geo_transform = np.array(dataset.GetGeoTransform())
-            num_x = dataset.RasterXSize
-            num_y = dataset.RasterYSize
+            g = gdal.Open(self.state_mask)
+            proj = g.GetProjection()
+            geoT = np.array(g.GetGeoTransform())
+            nx = g.RasterXSize
+            ny = g.RasterYSize
         except RuntimeError:
             proj = self.state_mask.GetProjection()
-            geo_transform = np.array(self.state_mask.GetGeoTransform())
-            num_x = self.state_mask.RasterXSize
-            num_y = self.state_mask.RasterYSize
+            geoT = np.array(self.state_mask.GetGeoTransform())
+            nx = self.state_mask.RasterXSize
+            ny = self.state_mask.RasterYSize
         # new_geoT = geoT*1.
         # new_geoT[0] = new_geoT[0] + self.ulx*new_geoT[1]
         # new_geoT[3] = new_geoT[3] + self.uly*new_geoT[5]
-        return proj, geo_transform.tolist(), num_x, num_y  # new_geoT.tolist()
+        return proj, geoT.tolist(), nx, ny  # new_geoT.tolist()
 
     def _find_granules(self, parent_folder, time_grid=None):
         """Finds granules. Currently does so by checking for
@@ -152,8 +150,7 @@ class Sentinel2Observations():
             ]
         # Sort dates by time, as currently S2A/S2B will be part of ordering
 
-        # test_files
-        #     = sorted(test_files, key=lambda x:dates[test_files.index(x)])
+        # test_files = sorted(test_files, key=lambda x:dates[test_files.index(x)])
         # dates = sorted(dates)
         if time_grid is not None:
             start_date = time_grid[0]
@@ -175,8 +172,7 @@ class Sentinel2Observations():
         self.date_data = {k: temp_dict[k] for k in dates}
         self.dates = dates
 
-        # self.date_data = dict(zip(self.dates,
-        #                          [f.parent for f in test_files]))
+        # self.date_data = dict(zip(self.dates, [f.parent for f in test_files]))
         self.bands_per_observation = {}
         LOG.info(f"Found {len(test_files):d} S2 granules")
         LOG.info(
@@ -219,17 +215,17 @@ class Sentinel2Observations():
         return s2_obs
 
     def read_granule(self, timestep):
-        """Reads data granule for a given `timestep`. Returns all relevant
+        """Reads data granule for a given `timestep`. Returns all relevant 
         bits and bobs (surface reflectrance, angles, cloud mask, uncertainty).
         The mask is true for OK pixels. If there are no suitable pixels, the
         returned tuple is a collection of `None`
-
-
+        
+        
         Parameters
         ----------
         timestep : datetime
             The datetime object
-
+        
         Returns
         -------
         tuple
@@ -286,14 +282,14 @@ class Sentinel2Observations():
         # Now, ensure all surface reflectance pixels have values above
         # 0 & aren't cloudy.
         # So valid pixels if all refl > 0 AND mask is True
-        # Array of the desired bands. Not necessarily contiguous.
+        # Array of the desired bands. Not necessarily contiguous. 
         sel_bands = np.array([1, 2, 3, 4, 5, 6, 7, 8])
         mask1 = np.logical_and(
             np.all(rho_surface[sel_bands] > 0, axis=0), mask
         )
         mask = mask1
         if mask.sum() == 0:
-            LOG.info("%s -> No clear observations", str(timestep))
+            LOG.info(f"{str(timestep):s} -> No clear observations")
             return None, None, None, None, None, None
         LOG.info(
             f"{str(timestep):s} -> Total of {mask.sum():d} clear pixels "
@@ -312,15 +308,15 @@ class Sentinel2Observations():
         sun_angles = reproject_data(
             str(current_folder.parent / "ANG_DATA/SAA_SZA.tif"),
             target_img=self.state_mask,
-            x_res=20,
-            y_res=20,
+            xRes=20,
+            yRes=20,
             resample=0,
         ).ReadAsArray()
         view_angles = reproject_data(
             str(current_folder.parent / "ANG_DATA/VAA_VZA_B05.tif"),
             target_img=self.state_mask,
-            x_res=20,
-            y_res=20,
+            xRes=20,
+            yRes=20,
             resample=0,
         ).ReadAsArray()
         sza = np.cos(np.deg2rad(sun_angles[1].mean() / 100.0))
@@ -332,20 +328,20 @@ class Sentinel2Observations():
 
 
 if __name__ == "__main__":
-    TIME_GRID = []
-    TODAY = dt.datetime(2017, 1, 1)
-    while TODAY <= dt.datetime(2017, 12, 31):
-        TIME_GRID.append(TODAY)
-        TODAY += dt.timedelta(days=5)
+    time_grid = []
+    today = dt.datetime(2017, 1, 1)
+    while today <= dt.datetime(2017, 12, 31):
+        time_grid.append(today)
+        today += dt.timedelta(days=5)
 
-    S2_OBS = Sentinel2Observations(
+    s2_obs = Sentinel2Observations(
         "/home/ucfajlg/Data/python/KaFKA_Validation/LMU/s2_obs/",
         "/home/ucfafyi/DATA/Prosail/prosail_2NN.npz",
         "/home/ucfajlg/Data/python/KaFKA_Validation/LMU/carto/ESU.tif",
         band_prob_threshold=20,
         chunk=None,
-        time_grid=TIME_GRID,
+        time_grid=time_grid,
     )
-    RET_VAL = S2_OBS.read_time_series(
+    retval = s2_obs.read_time_series(
         [dt.datetime(2017, 1, 1), dt.datetime(2017, 12, 31)]
     )

@@ -18,7 +18,10 @@ before_install:
 # And update pip to latest version
 install:
   - python -m pip install -U pip
-  - pip install -U tox tox-travis tox-conda
+  - pip install -U tox-travis
+  - conda install --yes gdal"<=2.5.2" numba scipy tensorflow pytest
 
 # Command to run tests, e.g. python setup.py test
 script: tox
+
+

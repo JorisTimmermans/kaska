@@ -3,41 +3,53 @@
 """Main module."""
 import logging
 
-from collections import namedtuple
+from pathlib import Path
+import datetime as dt
 import numpy as np
 
 from scipy.interpolate import interp1d
 
 from .NNParameterInversion import NNParameterInversion
 
+from .s2_observations import Sentinel2Observations
+
+from .s1_observations import Sentinel1Observations
+
 from .smoothn import smoothn
 
 from .utils import save_output_parameters
 
 from .interp_fix import interp1d
+from collections import namedtuple
 
+component_progress_logger = logging.getLogger('ComponentProgress')
+component_progress_logger.setLevel(logging.INFO)
+component_progress_formatter = logging.Formatter('%(levelname)s:%(name)s:%(message)s')
+component_progress_logging_handler = logging.StreamHandler()
+component_progress_logging_handler.setLevel(logging.INFO)
+component_progress_logging_handler.setFormatter(component_progress_formatter)
+component_progress_logger.addHandler(component_progress_logging_handler)
 LOG = logging.getLogger(__name__)
 
 
-class KaSKA:
+class KaSKA(object):
     """The main KaSKA object"""
 
     def __init__(self, observations, time_grid, state_mask, approx_inverter,
-                 output_folder,
-                 chunk=None):
+                output_folder, chunk = None, save_sgl_inversion=True):
         self.time_grid = time_grid
         self.observations = observations
         self.state_mask = state_mask
         self.output_folder = output_folder
         self.inverter = NNParameterInversion(approx_inverter)
         self.chunk = chunk
-        self.save_sgl_inversion = True
+        self.save_sgl_inversion = save_sgl_inversion
 
     def first_pass_inversion(self):
         """A first pass inversion. Could be anything, from a quick'n'dirty
         LUT, a regressor. As coded, we use the `self.inverter` method, which
         in this case, will call the ANN inversion."""
-        state_mask = self.observations.state_mask.ReadAsArray()
+        state_mask = self.state_mask.ReadAsArray()
         state_mask = state_mask.astype(np.bool)
         LOG.info("Doing first pass inversion!")
         S = {}
@@ -49,9 +61,9 @@ class KaSKA:
         return S
 
     def _process_first_pass(self, first_passer_dict):
-        """This method takes the first pass estimates of surface parameters
+        """This methods takes the first pass estimates of surface parameters
         (stored as a dictionary) and assembles them into an
-        `(n_params, n_times, num_x, num_y)` grid. The assumption here is the
+        `(n_params, n_times, nx, ny)` grid. The assumption here is the
         dictionary is indexed by dates (e.g. datetime objects) and that for
         each date, we have a list of parameters.
 
@@ -61,12 +73,12 @@ class KaSKA:
             A dictionary with first pass guesses in an irregular temporal grid
 
         """
-        dates = list(first_passer_dict.keys())
-        n_params, num_x, num_y = first_passer_dict[dates[0]].shape
-        param_grid = np.zeros((n_params, len(dates), num_x, num_y))
+        dates = [k for k in first_passer_dict.keys()]
+        n_params, nx, ny = first_passer_dict[dates[0]].shape
+        param_grid = np.zeros((n_params, len(dates), nx, ny))
         for i, k in enumerate(dates):
             for j in range(n_params):
-                param_grid[j, i, :, :] = first_passer_dict[k][j]
+                    param_grid[j, i, :, :] = first_passer_dict[k][j]
         # param_grid = np.zeros((n_params, len(self.time_grid), nx, ny))
         # idx = np.argmin(np.abs(self.time_grid -
         #                 np.array(dates)[:, None]), axis=1)
@@ -90,14 +102,15 @@ class KaSKA:
         inverting on a observation by observation fashion, and then performs
         a per pixel smoothing/interpolation."""
         dates, retval = self._process_first_pass(self.first_pass_inversion())
+        component_progress_logger.info('50')
         LOG.info("Burp! Now doing temporal smoothing")
         return self._run_smoother(dates, retval)
-        # x0 = np.zeros_like(retval)
-        # for param in range(retval.shape[0]):
-        #     S = retval[param]*1
-        #     ss = smoothn(S, isrobust=True, s=1, TolZ=1e-2, axis=0)
-        #     x0[param, :, :] = ss[0]
-        # return x0
+        #x0 = np.zeros_like(retval)
+        #for param in range(retval.shape[0]):
+        #    S = retval[param]*1
+        #    ss = smoothn(S, isrobust=True, s=1, TolZ=1e-2, axis=0)
+        #    x0[param, :, :] = ss[0]
+        #return x0
 
     def _run_smoother(self, dates, parameter_block):
         """Very specific method that applies some parameter transformations
@@ -112,14 +125,13 @@ class KaSKA:
         cbrown = parameter_block[2, :, :, :]
         if self.save_sgl_inversion:
             save_output_parameters(dates, self.observations,
-                                   self.output_folder / "single_imgs",
-                                   ["lai", "cab", "cbrown"],
-                                   [lai, cab, cbrown], output_format="GTiff",
-                                   chunk=self.chunk, fname_pattern="s2_sgl",
-                                   options=['COMPRESS=DEFLATE',
-                                            'BIGTIFF=YES',
-                                            'PREDICTOR=1',
-                                            'TILED=YES'])
+                self.output_folder + "/single_imgs/", ["lai", "cab", "cbrown"],
+                           [lai, cab, cbrown], output_format="GTiff",
+                           chunk=self.chunk, fname_pattern="s2_sgl",
+                           options=['COMPRESS=DEFLATE',
+                                    'BIGTIFF=YES',
+                                    'PREDICTOR=1',
+                                    'TILED=YES'])
 
         # Basically, remove weird values outside of boundaries, nans and stuff
         # Could be done simply with the previously stated data structure, as
@@ -131,7 +143,7 @@ class KaSKA:
         cab[cab < 0] = np.nan
         cbrown[cbrown < 0] = np.nan
         # Create a mask where we have no (LAI) data
-        # mask = np.all(lai == 0, axis=(0))
+        mask = np.all(lai == 0, axis=(0))
 
         # Time axes in days of year
         doys = np.array([int(x.strftime('%j')) for x in dates])
@@ -145,21 +157,21 @@ class KaSKA:
         cabi[np.isnan(cabi)] = 0
         cbrowni[np.isnan(cbrowni)] = 0
         # Smooth on observations grid
-        slai = smoothn(np.array(laii), W=2*np.array(laii), isrobust=True,
-                       s=0.05, TolZ=1e-6, axis=0)[0]
-        slai[slai < 0] = 0
-        scab = smoothn(np.array(cabi), W=slai, isrobust=True, s=0.5,
+        slai = smoothn(np.array(laii), W=2*np.array(laii), isrobust=True, s=0.05,
                        TolZ=1e-6, axis=0)[0]
+        slai[slai < 0] = 0
+        component_progress_logger.info('66')
+        scab = smoothn(np.array(cabi), W=slai, isrobust=True, s=0.5,
+                        TolZ=1e-6, axis=0)[0]
+        component_progress_logger.info('84')
         scbrown = smoothn(np.array(cbrowni), W=slai, isrobust=True, s=0.5,
-                          TolZ=1e-6, axis=0)[0]
+                        TolZ=1e-6, axis=0)[0]
         # Interpolate to state grid
         laii = interp1d(doy_grid, doys, slai)
         cabi = interp1d(doy_grid, doys, scab)
-        cbrowni = interp1d(doy_grid, doys, scbrown)
-        # return (["lai", "cab", "cbrown"], [laii, cabi, cbrowni])
-        SmootherResults = namedtuple("SmootherResults",
-                                     ["temporal_grid", "slai",
-                                      "scab", "scbrown"])
+        cbrowni =  interp1d(doy_grid, doys, scbrown)
+        #return (["lai", "cab", "cbrown"], [laii, cabi, cbrowni])
+        SmootherResults = namedtuple("SmootherResults", ["temporal_grid", "slai", "scab", "scbrown"])
         return SmootherResults(self.time_grid, laii, cabi, cbrowni)
 
     def save_s2_output(self, parameter_names, output_data,
