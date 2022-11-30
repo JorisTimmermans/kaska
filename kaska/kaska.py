@@ -24,14 +24,14 @@ class KaSKA:
 
     def __init__(self, observations, time_grid, state_mask, approx_inverter,
                  output_folder,
-                 chunk=None):
+                 chunk=None,save_sgl_inversion=True):
         self.time_grid = time_grid
         self.observations = observations
         self.state_mask = state_mask
         self.output_folder = output_folder
         self.inverter = NNParameterInversion(approx_inverter)
         self.chunk = chunk
-        self.save_sgl_inversion = True
+        self.save_sgl_inversion = save_sgl_inversion
 
     def first_pass_inversion(self):
         """A first pass inversion. Could be anything, from a quick'n'dirty
