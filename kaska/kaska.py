@@ -134,8 +134,10 @@ class KaSKA:
         # mask = np.all(lai == 0, axis=(0))
 
         # Time axes in days of year
-        doys = np.array([int(x.strftime('%j')) for x in dates])
-        doy_grid = np.array([int(x.strftime('%j')) for x in self.time_grid])
+        doys =  np.array([date.toordinal() for date in dates])
+        doy_grid = np.array([date.toordinal() for date in self.time_grid])
+#         doys = np.array([int(x.strftime('%j')) for x in dates])
+#         doy_grid = np.array([int(x.strftime('%j')) for x in self.time_grid])
         # Do a linear interpolation for missing values in the observations
         laii = interp1d(doys, doys, lai)
         cabi = interp1d(doys, doys, cab)
