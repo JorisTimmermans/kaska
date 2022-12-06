@@ -9,10 +9,10 @@ LICENSE: GNU GENERAL PUBLIC LICENSE V3
 '''
 
 import numpy as np
-from numba import jit
+# from numba import jit
 
 
-@jit(nopython=True)
+# @jit(nopython=True)
 def interp1d(newx, oldx, oldy):
     """Linear interpolation."""
     if oldx.shape[0] != oldy.shape[0]:
