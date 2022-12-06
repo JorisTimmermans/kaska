@@ -144,23 +144,29 @@ class KaSKA:
         laii[np.isnan(laii)] = 0
         cabi[np.isnan(cabi)] = 0
         cbrowni[np.isnan(cbrowni)] = 0
+        
         # Smooth on observations grid
-        slai = smoothn(np.array(laii), w=2*np.array(laii), isrobust=True,
-                       s=0.05, tol_z=1e-6, axis=0)[0]
-        slai[slai < 0] = 0
-        scab = smoothn(np.array(cabi), w=slai, isrobust=True, s=0.5,
-                       tol_z=1e-6, axis=0)[0]
-        scbrown = smoothn(np.array(cbrowni), w=slai, isrobust=True, s=0.5,
-                          tol_z=1e-6, axis=0)[0]
+        smooth = False
+        if smooth==False:
+            slai = laii
+            scab = cabi
+            scbrown == scbrown
+        else:
+            tolz = 1e-3 # 1e-6
+            slai = smoothn(np.array(laii), w=2*np.array(laii), isrobust=True,s=0.05, tol_z=tolz, axis=0)[0]        
+            scab = smoothn(np.array(cabi), w=slai, isrobust=True, s=0.5, tol_z=tolz, axis=0)[0]
+            scbrown = smoothn(np.array(cbrowni), w=slai, isrobust=True, s=0.5,tol_z=tolz, axis=0)[0]
+            slai[slai < 0] = 0
+            
         # Interpolate to state grid
-        laii = interp1d(doy_grid, doys, slai)
-        cabi = interp1d(doy_grid, doys, scab)
-        cbrowni = interp1d(doy_grid, doys, scbrown)
+        slaii = interp1d(doy_grid, doys, slai)
+        scabi = interp1d(doy_grid, doys, scab)
+        scbrowni = interp1d(doy_grid, doys, scbrown)
         # return (["lai", "cab", "cbrown"], [laii, cabi, cbrowni])
         SmootherResults = namedtuple("SmootherResults",
                                      ["temporal_grid", "slai",
                                       "scab", "scbrown"])
-        return SmootherResults(self.time_grid, laii, cabi, cbrowni)
+        return SmootherResults(self.time_grid, slaii, scabi, scbrowni)
 
     def save_s2_output(self, parameter_names, output_data,
                        time_grid=None, output_format="GTiff"):
