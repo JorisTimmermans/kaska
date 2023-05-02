@@ -7,7 +7,7 @@ import logging
 from collections import namedtuple
 from pathlib import Path
 
-import gdal
+from osgeo import gdal
 import numpy as np
 
 from .TwoNN import Two_NN
